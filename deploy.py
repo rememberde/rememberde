@@ -1,16 +1,20 @@
-"""deploy.py — 一键部署到服务器并运行实验（GPU 加速）。
+"""deploy.py — 一键部署到服务器并运行实验（GPU 加速，Git 同步）。
 
 服务器：remember@10.25.64.102（有 GPU，Python 环境已就绪）
-本脚本在本地 Windows 运行，通过 SSH/SCP 远程操作。
+本脚本在本地 Windows 运行，通过 SSH 远程操作，代码通过 Git 同步。
 
 用法：
-  python deploy.py setup     # 传代码 + 数据到服务器（首次必跑）
-  python deploy.py run       # 远程后台跑 main.py（nohup，SSH 断开不影响）
-  python deploy.py status    # 查看远程实验是否在跑 + 当前进度
-  python deploy.py tail      # 实时查看远程日志（Ctrl+C 退出）
-  python deploy.py fetch     # 拉回 results/ + image/ + logs/ 到本地
-  python deploy.py all       # setup + run + 轮询等完成 + fetch（一键到底）
-  python deploy.py all_baseline  # 多卡并行跑 run_wj.py + 合并 + SOTA 对比
+  python deploy.py setup          # Git 同步代码到服务器（git push + 服务器 git pull）
+  python deploy.py setup_data     # 首次同步数据集（scp，大文件不进 Git）
+  python deploy.py run            # 远程后台跑 main.py（nohup，SSH 断开不影响）
+  python deploy.py status         # 查看远程实验是否在跑 + 当前进度
+  python deploy.py tail           # 实时查看远程日志（Ctrl+C 退出）
+  python deploy.py fetch          # 拉回 results/ + image/ + logs/ 到本地
+  python deploy.py all            # setup + run + 轮询等完成 + fetch（一键到底）
+  python deploy.py all_baseline   # 多卡并行跑 run_wj.py + 合并 + SOTA 对比
+
+Git 工作流：
+  本地修改代码 → git commit → python deploy.py setup → 服务器 git pull
 
 目录结构（本地和服务器一致）：
   - wj/        WJ 核心包
@@ -21,7 +25,7 @@
 
 注意：
   - 服务器路径默认 ~/WJ，可在下方 REMOTE_DIR 修改
-  - 首次 setup 后，代码改动只需再跑 setup 增量同步
+  - 代码通过 Git 同步（setup），数据集首次需 setup_data
   - run 是后台运行，SSH 断开实验继续跑；用 status/tail 监控
 """
 import argparse
@@ -121,37 +125,82 @@ def scp_down(remote_path: str, local_path: str):
 
 # ============================== 子命令 ==============================
 def cmd_setup():
-    """把代码 + 数据同步到服务器。"""
-    print(f"[setup] 同步代码到 {SERVER}:{REMOTE_DIR} ...")
-    subprocess.run(["ssh"] + SSH_OPTS + [SERVER, f"mkdir -p {REMOTE_DIR}"],
-                   check=True)
-    # 在服务器上创建 logs/ 和 results/ 子目录（保持和本地一致的目录结构）
-    ssh(f"mkdir -p {REMOTE_DIR}/logs {REMOTE_DIR}/results", check=False, capture=True)
-    # 逐个上传：目录先删旧的避免 scp -r 嵌套；文件直接覆盖
-    for item in SYNC_ITEMS:
-        local = str(ROOT / item)
-        if not os.path.exists(local):
-            print(f"  [skip] {item} (本地不存在)")
-            continue
-        remote_item = f"{REMOTE_DIR}/{item}"
-        # scp -r source dest_parent/ → 创建 dest_parent/source/
-        # 所以 dest_parent 必须是 item 的父目录路径，才能保持目录结构
-        # 例：item="data/cora" → remote_parent="~/WJ/data/" → 创建 ~/WJ/data/cora/
-        remote_parent = remote_item.rsplit("/", 1)[0] + "/"
-        if os.path.isdir(local):
-            ssh(f"rm -rf {remote_item}", check=False, capture=True)
-            # 确保远程父目录存在
-            ssh(f"mkdir -p {remote_parent.rstrip('/')}", check=False, capture=True)
-        print(f"  [up] {item} -> {remote_item}")
-        scp_up(local, remote_parent)
+    """Git 同步代码到服务器（本地 git push + 服务器 git pull）。
 
-    print(f"[setup] 完成。远程目录: {REMOTE_DIR}")
+    工作流：
+      1. 本地：git add -A && git commit -m "sync" && git push
+      2. 服务器：git pull
+
+    数据集（data/）和结果文件（results/*.json）不进 Git，需首次用 setup_data 同步。
+    """
+    import shutil
+    # 检查本地是否有 Git
+    git_exe = shutil.which("git")
+    if not git_exe:
+        # 尝试硬编码路径
+        git_exe = r"E:\Tools\Git\Git\bin\git.exe"
+        if not os.path.exists(git_exe):
+            print("[setup] 错误：未找到 Git，请安装或添加到 PATH")
+            sys.exit(1)
+
+    print("[setup] Git 同步代码到 GitHub ...")
+    # 检查是否有未提交的改动
+    r = subprocess.run([git_exe, "status", "--porcelain"], capture_output=True, text=True)
+    if r.stdout.strip():
+        print("[setup] 发现代码改动，正在提交 ...")
+        subprocess.run([git_exe, "add", "-A"], check=True)
+        subprocess.run([git_exe, "commit", "-m", "sync: deploy setup"], check=True)
+    else:
+        print("[setup] 代码无改动")
+
+    # Push 到 GitHub
+    r = subprocess.run([git_exe, "push"], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"[setup] git push 失败: {r.stderr}")
+        sys.exit(1)
+    print("[setup] 本地代码已推送到 GitHub")
+
+    # 服务器 git pull
+    print(f"[setup] 服务器 {SERVER} 拉取代码 ...")
+    out = ssh(f"git pull", check=False, capture=True)
+    print(f"  {out}")
+
+    # 检查 GPU 环境
     print("[setup] 检查服务器 GPU 和 Python 环境 ...")
     out = ssh(f"{REMOTE_PYTHON} -c 'import torch; print(\"cuda:\", "
               f"torch.cuda.is_available(), \"| device:\", "
               f"torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"cpu\")'",
               check=False, capture=True)
     print(f"  {out}")
+    print("[setup] 完成")
+
+
+def cmd_setup_data():
+    """首次同步数据集到服务器（scp 方式，大文件不进 Git）。
+
+    数据集（data/）在 .gitignore 中被排除，需首次手动同步。
+    后续数据集不变，无需重复同步。
+    """
+    print(f"[setup_data] 同步数据集到 {SERVER}:{REMOTE_DIR}/data ...")
+    # 确保 data/ 目录存在
+    ssh(f"mkdir -p {REMOTE_DIR}/data", check=False, capture=True)
+
+    for item in SYNC_ITEMS:
+        if not item.startswith("data/"):
+            continue
+        local = str(ROOT / item)
+        if not os.path.exists(local):
+            print(f"  [skip] {item} (本地不存在)")
+            continue
+        remote_item = f"{REMOTE_DIR}/{item}"
+        remote_parent = remote_item.rsplit("/", 1)[0] + "/"
+        if os.path.isdir(local):
+            ssh(f"rm -rf {remote_item}", check=False, capture=True)
+            ssh(f"mkdir -p {remote_parent.rstrip('/')}", check=False, capture=True)
+        print(f"  [up] {item} -> {remote_item}")
+        scp_up(local, remote_parent)
+
+    print("[setup_data] 完成")
 
 
 def cmd_run(args):
@@ -474,7 +523,8 @@ def main():
     parser = argparse.ArgumentParser(description="部署实验到服务器并运行")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("setup", help="传代码 + 数据到服务器")
+    sub.add_parser("setup", help="Git 同步代码到服务器")
+    sub.add_parser("setup_data", help="首次同步数据集（scp，大文件不进 Git）")
 
     p_status = sub.add_parser("status", help="查看远程实验进度")
     p_status.add_argument("--log", default=None,
@@ -534,6 +584,8 @@ def main():
     args = parser.parse_args()
     if args.cmd == "setup":
         cmd_setup()
+    elif args.cmd == "setup_data":
+        cmd_setup_data()
     elif args.cmd == "run":
         cmd_run(args)
     elif args.cmd == "status":
