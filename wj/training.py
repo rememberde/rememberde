@@ -36,7 +36,10 @@ class TrainConfig:
     anneal: str = "cosine"         # "constant" | "linear" | "cosine"
     entropy: str = "size"          # "none" | "size" | "assign" | "method2"
     n_bins: int = 16               # Method-2 bin count
-    sigma: float = 0.5             # Method-2 RBF bandwidth
+    sigma: float = 0.125           # Method-2 RBF bandwidth（1D 语义）
+                                   # 逐维 1D 距离的典型量级是 σ_z²，
+                                   # d 维距离的量级是 d·σ_z²。
+                                   # σ_1d = σ_d / √d = 0.5/√16 = 0.125
     lambda_rank: float = 0.0       # anti-collapse penalty weight (0=off)
     rank_min_rank: float = 2.0     # hinge: only penalise eff_rank below this
     rank_min_var: float = 0.5      # hinge: only penalise tr(S) below this

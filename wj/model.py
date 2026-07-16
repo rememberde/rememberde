@@ -51,13 +51,16 @@ class EntropyGNN(nn.Module):
         self.feat_decoder = nn.Linear(emb_dim, feat_dim) if feat_recon else None
         # 逐维 bin 中心：固定 1D 锚点（不可学习）。
         # 形状 (d, M)：第 j 行是第 j 维的 M 个 1D bin 中心。
-        # 用正态初始化让 bin 中心在 0 附近 spread 开，匹配嵌入维度的典型尺度。
+        # 每维独立 L2 归一化到单位球面，保证每维的 M 个 bin 中心 spread 开。
         # 固定 C 让 method2 的 ln W 梯度真正指向"z_i 在多个固定锚点间 spread"，
         # 而不是通过移动 C 偷懒到饱和状态（历史教训：可学习 C 会跟着 z_i 一起塌缩）。
         # 逐维 1D binning 相比 d 维整体 binning：
         #   - 粒度更细（d×M 个 1D bin vs M 个 d 维 bin）
         #   - 每维独立优化，单维塌缩时该维 S_j→0，更敏感的塌缩检测
+        #   - 每维 L2 归一化匹配 Z 的单维典型尺度（原版 d 维 L2 归一化的逐维推广）
         _anchors = torch.randn(emb_dim, n_bins)
+        # 每维独立 L2 归一化：dim=1 对应 M 个 bin 中心
+        _anchors = _anchors / _anchors.norm(dim=1, keepdim=True)
         self.register_buffer("bin_centers", _anchors)
         # 默认特征缓存：SBM 用 one-hot；Cora 等真实图由 forward 接收 X_feat
         # 注意：_default_X 不注册为 parameter/buffer，避免被 .to(device) 重复移动；
@@ -112,18 +115,21 @@ def method2_lnw(Z: torch.Tensor, Q: torch.Tensor, C: torch.Tensor,
                 sigma: float, eps: float = 1e-8) -> torch.Tensor:
     """逐维度玻尔兹曼微观态计数（每维独立 1D soft binning + Stirling 近似）。
 
-    对每个维度 j 独立计算 1D 玻尔兹曼熵，总 lnW = 各维 lnW 之和：
+    对每个维度 j 独立计算 1D 玻尔兹曼熵，总 lnW = 各维 lnW 之平均：
       对维度 j：
         w_ib_j = softmax_b(-|z_i[j] - c_b[j]|^2 / 2 sigma^2)   (1D 距离)
         n_kb_j = Σ_i q_ik * w_ib_j                              (社区 k 在 bin b 的计数)
         p_kb_j = n_kb_j / n_k_j
         lnW_j = -Σ_{k,b} n_kb_j * log p_kb_j
-      总 lnW = Σ_j lnW_j
+      总 lnW = (1/d) Σ_j lnW_j    ← 除以 d 归一化，消除尺度膨胀
 
-    相比原 d 维整体计算的优势：
-      - 粒度更细：d×M 个 1D bin vs M 个 d 维 bin（d=16 时细 16 倍）
-      - 每维独立优化，单维塌缩时该维 lnW_j→0，更敏感的塌缩检测
-      - 1D 距离避免高维空间的稀疏性和数值问题
+    关键设计：
+      1. 除以 d 归一化：逐维求和会让 lnW 膨胀 d 倍，压倒重建项 E。
+         除以 d 后 lnW 量级与原 d 维整体计算一致，T 和 sigma 无需大幅调整。
+      2. sigma 是 1D 语义：1D 距离 (z[j]-c[j])² 的典型量级是 σ_z²，
+         而 d 维距离 ||z-c||² 的量级是 d·σ_z²。要达到相同的 softmax 柔和度，
+         σ_1d = σ_d / sqrt(d)。TrainConfig.sigma 默认 0.125（=0.5/√16）。
+      3. bin 中心每维 L2 归一化：匹配 Z 的单维典型尺度。
 
     Q 仍由 EntropyGNN.forward 的 comm_head(Z) 整体计算（不逐维分解），
     保证社区分配与嵌入整体结构一致。
@@ -131,13 +137,14 @@ def method2_lnw(Z: torch.Tensor, Q: torch.Tensor, C: torch.Tensor,
     Args:
         Z: 嵌入矩阵 (N, d)
         Q: 社区分配矩阵 (N, K)，由 EntropyGNN.forward 产生（每行和为 1）
-        C: 逐维 bin 中心 (d, M)，固定 1D 锚点
-        sigma: RBF 带宽（每维共用）
+        C: 逐维 bin 中心 (d, M)，固定 1D 锚点（每维 L2 归一化）
+        sigma: 1D RBF 带宽（注意：1D 语义，非 d 维语义）
         eps: 数值稳定地板
 
     Returns:
         lnW（标量 tensor，未归一化）；caller 除以 N 得 per-node 尺度
     """
+    d = Z.shape[1]
     # 逐维 1D 距离: (N, d, M)
     # Z[:,j] 是第 j 维坐标 (N,)，C[j,:] 是第 j 维的 M 个 bin 中心 (M,)
     Z_exp = Z.unsqueeze(2)              # (N, d, 1)
@@ -154,8 +161,9 @@ def method2_lnw(Z: torch.Tensor, Q: torch.Tensor, C: torch.Tensor,
     n_k = Nk.sum(dim=2, keepdim=True)   # (K, d, 1)
     p_kb = Nk / (n_k + eps)             # (K, d, M)
 
-    # 玻尔兹曼熵: 对所有维度、社区、bin 求和
-    lnW = -(Nk * torch.log(p_kb + eps)).sum()
+    # 玻尔兹曼熵: 对所有维度、社区、bin 求和，然后除以 d 归一化
+    # 除以 d 让 lnW 量级与原 d 维整体计算一致，避免熵项压倒重建项
+    lnW = -(Nk * torch.log(p_kb + eps)).sum() / d
     return lnW
 
 
