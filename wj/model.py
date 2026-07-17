@@ -26,7 +26,7 @@ class GCNLayer(nn.Module):
 
 
 class EntropyGNN(nn.Module):
-    """两层 GCN → 嵌入 Z → 社区头 Q。
+    """两层 GCN → 嵌入 Z → 社区头 Q（可选双路编码器）。
 
     bin 中心 C 是固定锚点（register_buffer，不可学习），用正态初始化后 L2
     归一化到单位球面。固定 C 让 method2 的 ln W 梯度真正指向"z_i 在多个
@@ -36,15 +36,31 @@ class EntropyGNN(nn.Module):
     节点特征支持两种模式：
       - 默认（node_feature_dim=None）：用 one-hot I_N，SBM 实验用
       - 外部特征（Cora 等）：传入 node_feature_dim，forward 时再传 X
+
+    双路编码器（dual_encoder=True，仅在有外部特征时生效）：
+      - 图路径（GCN）：A_hat @ X → H_g → Z_g，编码图结构社区
+      - 特征路径（MLP）：X → H_f → Z_f，编码特征语义（不经过 GCN）
+      - 融合：Z = Z_g + Z_f，让 Z 同时编码图结构和特征语义
+      动机：CiteSeer 弱社区图（CC=0.14）图结构不可靠，mod=0.75 但 ARI=0.22
+      （图结构社区≠标签社区）。特征路径不依赖图结构，弥补 GCN 过度依赖
+      弱社区结构的缺陷。DCRN 的双自编码器已证明此架构有效。
     """
     def __init__(self, n_nodes: int, hidden_dim: int, emb_dim: int,
                  n_communities: int, n_bins: int = 16,
-                 node_feature_dim: int = None, feat_recon: bool = False):
+                 node_feature_dim: int = None, feat_recon: bool = False,
+                 dual_encoder: bool = True):
         super().__init__()
         # 输入特征维度：外部特征优先，否则退化为 one-hot（SBM 无节点特征）
         feat_dim = node_feature_dim if node_feature_dim is not None else n_nodes
+        # 图路径（现有）：两层 GCN
         self.gcn1 = GCNLayer(feat_dim, hidden_dim)
         self.gcn2 = GCNLayer(hidden_dim, emb_dim)
+        # 特征路径（新增）：两层 MLP，不经过 GCN
+        # 仅在有外部特征时启用（one-hot 无语义信息，双路无意义）
+        self.dual_encoder = dual_encoder and node_feature_dim is not None
+        if self.dual_encoder:
+            self.fc1_feat = nn.Linear(feat_dim, hidden_dim)
+            self.fc2_feat = nn.Linear(hidden_dim, emb_dim)
         self.comm_head = nn.Linear(emb_dim, n_communities)
         # 特征重建解码器（可选）：从 Z 重建 X，强制 Z 编码特征信息
         # 适用于弱社区图（CiteSeer），特征比图结构更可靠
@@ -78,8 +94,18 @@ class EntropyGNN(nn.Module):
         # 这里按需搬到 A_hat 所在设备，避免跨设备报错
         if X is None:
             X = self._default_X.to(A_hat.device)
-        H = F.relu(self.gcn1(X, A_hat))
-        Z = self.gcn2(H, A_hat)
+        # 图路径（GCN）：A_hat @ X → H_g → Z_g，编码图结构社区
+        H_g = F.relu(self.gcn1(X, A_hat))
+        Z_g = self.gcn2(H_g, A_hat)
+        # 特征路径（MLP）：X → H_f → Z_f，编码特征语义（不经过 GCN）
+        # 仅在 dual_encoder 启用时计算（SBM 无外部特征时自动跳过）
+        if self.dual_encoder:
+            H_f = F.relu(self.fc1_feat(X))
+            Z_f = self.fc2_feat(H_f)
+            # 加法融合：让 Z 同时编码图结构和特征语义
+            Z = Z_g + Z_f
+        else:
+            Z = Z_g
         logits = self.comm_head(Z) / math.sqrt(self.comm_head.in_features)
         Q = F.softmax(logits, dim=-1)
         # 特征重建（可选）：从 Z 重建 X，强制 Z 编码特征信息

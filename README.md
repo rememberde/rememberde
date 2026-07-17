@@ -18,21 +18,54 @@ W = N! / ∏_k n_k!              # 社区大小 n_k 的多重组合数
 S = k · ln W                   # Boltzmann 熵
 ```
 
-### 1.2 Method 2：Stirling 近似 + 软分箱
+### 1.2 Method 2：逐维 Stirling 近似 + 1D 软分箱（V7 修复版）
 
-直接最大化 `ln W` 不可微。本项目用两步近似让它可微：
+直接最大化 `ln W` 不可微。本项目用**逐维度**的两步近似让它可微：
 
-1. **Stirling 展开**：`ln W ≈ -Σ_{k,b} n_kb · log(p_kb)`，把社区大小计数推广到 (社区 k, bin b) 联合计数 `n_kb`
-2. **软分箱**：`w_ib = softmax_b(-‖z_i - c_b‖² / 2σ²)`（RBF-softmax，bin 中心 `c_b` 可学习），让 `n_kb = Σ_i q_ik · w_ib` 可微
+**核心思想**：每个节点有 d 维嵌入 `z_i ∈ R^d`。对**每一维 j**（共 d 维）独立计算 1D 玻尔兹曼熵，这一维包含**所有节点的同一维坐标** `Z[:, j] ∈ R^N`。最后通过自由能 `F = E - T·S` 对所有节点做损失。
 
-最终自由能目标：
+**逐维计算流程**（对维度 j ∈ {1, ..., d}）：
+
+1. **1D 距离**：取所有 N 个节点的第 j 维坐标 `Z[:, j]`，与第 j 维的 M 个 1D bin 中心 `C[j, :]` 计算平方距离
+   ```
+   dist²_ib_j = (z_i[j] - c_b[j])²        # 1D 距离，i=节点，b=bin
+   ```
+2. **1D 软分箱**：RBF-softmax 让每个节点在每维的 bin 间 soft 分配
+   ```
+   w_ib_j = softmax_b(-dist²_ib_j / 2σ²)   # (N, M)，σ 是 1D 带宽
+   ```
+3. **社区-bin 联合计数**：用整体 Q（comm_head 输出）加权
+   ```
+   n_kb_j = Σ_i q_ik · w_ib_j               # (K, M)，社区 k 在 bin b 的计数
+   p_kb_j = n_kb_j / n_k_j                   # 归一化
+   ```
+4. **逐维玻尔兹曼熵**：
+   ```
+   lnW_j = -Σ_{k,b} n_kb_j · log(p_kb_j)    # Stirling 近似
+   ```
+5. **总 lnW（除以 d 归一化）**：
+   ```
+   lnW = (1/d) Σ_j lnW_j                     # 消除 d 倍尺度膨胀
+   ```
+
+**最终自由能目标**：
 
 ```
-F(Z, Q) = E(Z, A) - T(t) · S(Q)
+F(Z, Q) = E(Z, A) - T(t) · S(Z, Q)
   E(Z, A) = BCE_with_logits(Z Z^T, A)          # 图重建
-  S(Q)    = ln W / N                            # 每节点熵
+  S(Z, Q) = lnW / N = (1/d) Σ_j lnW_j / N      # 每节点逐维熵
   T(t)    = T_max · 0.5(1 + cos(π·s))          # 退火，T→0 时 commit 到硬划分
 ```
+
+**V7 修复版的三个关键设计**（相比 V6.1 d 维整体计算的改动）：
+
+| 设计 | V6.1（d 维整体） | V7 修复版（逐维） | 原因 |
+|---|---|---|---|
+| **lnW 归一化** | `Σ_{k,b} n_kb·log p_kb` | `(1/d) Σ_j Σ_{k,b} n_kb_j·log p_kb_j` | 逐维求和膨胀 d 倍，除以 d 保持量级一致 |
+| **sigma 语义** | σ=0.5（d 维距离） | σ=0.125（1D 距离）= 0.5/√d | 1D 距离比 d 维小 √d 倍，σ 需相应缩小 |
+| **bin 中心** | (M, d) 整体 L2 归一化 | (d, M) 每维独立 L2 归一化 | 匹配 Z 的单维典型尺度 |
+
+**为什么 Q 不逐维分解**：社区分配是节点的整体属性（每个节点属于哪个社区），不是某一维的属性。Q 由 `comm_head(Z)` 整体计算，在逐维熵计算中共享，保证社区分配与嵌入整体结构一致。
 
 ### 1.3 塌缩问题与双铰链修复
 
@@ -56,8 +89,8 @@ penalty = ReLU(min_rank - eff_rank) / min_rank    # 秩铰链：阻止 rank-1 �
 | 概念 | 公式 / 含义 |
 |---|---|
 | **W（微观态数）** | `W = N! / ∏ n_k!`，社区多重组合数 |
-| **ln W（Stirling 近似）** | `ln W ≈ -Σ_{k,b} n_kb · log(p_kb)`，可微 |
-| **软分箱** | `w_ib = softmax_b(-‖z_i - c_b‖² / 2σ²)`，RBF-softmax |
+| **ln W（逐维 Stirling 近似）** | `lnW = (1/d) Σ_j [-Σ_{k,b} n_kb_j · log(p_kb_j)]`，逐维 1D 可微 |
+| **1D 软分箱** | `w_ib_j = softmax_b(-(z_i[j]-c_b[j])² / 2σ²)`，逐维 RBF-softmax |
 | **自由能** | `F = E - T·S`，T 退火让模型最终 commit 到硬划分 |
 | **参与率 / 有效秩** | `eff_rank = (tr S)² / tr(S²) ∈ [1, d]`，**尺度不变** |
 | **总方差** | `tr(S) = Σ_d Var(Z[:,d])`，**尺度敏感**（互补信号） |
@@ -70,7 +103,7 @@ penalty = ReLU(min_rank - eff_rank) / min_rank    # 秩铰链：阻止 rank-1 �
 ```python
 TrainConfig(
     entropy="method2", T_max=0.3, T_warmup=0.2, anneal="cosine",
-    n_bins=16, sigma=0.5, lambda_rank=3.0,
+    n_bins=16, sigma=0.125, lambda_rank=3.0,   # sigma 是 1D 语义（V7 修复版）
     rank_min_rank=3.0,   # 秩铰链地板 ≈ K/2~K（K 为社区数）
     rank_min_var=1.0,    # 方差铰链地板 ≈ 0.5~1.0，低于健康 trS≈1.3~2.4
 )

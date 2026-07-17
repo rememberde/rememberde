@@ -7,6 +7,51 @@
 
 ---
 
+## 2026-07-16 — V7 修复版：逐维玻尔兹曼成功，Cora 三项指标领先 SOTA
+
+### 背景
+
+V7 原版（逐维玻尔兹曼）因三个参数问题完全失败（最佳变体变成 vanilla，所有指标比 V6.1 更差）。根因分析后修复，逐维 method2 成为有效核心。
+
+### 核心方法：逐维玻尔兹曼熵
+
+对嵌入 Z ∈ R^{N×d} 的**每一维 j** 独立计算 1D 玻尔兹曼熵：
+- 维度 j 包含所有 N 个节点的第 j 维坐标 Z[:, j] ∈ R^N
+- 用 M 个 1D bin 中心 C[j, :] 做 soft binning
+- 总 lnW = (1/d) Σ_j lnW_j（除以 d 归一化）
+- 通过自由能 F = E - T·S 对所有节点做损失，S = lnW/N
+
+### 三个关键修复
+
+1. **lnW / d 归一化**：逐维求和膨胀 d 倍，除以 d 保持量级与原 d 维整体一致
+2. **sigma 0.5 → 0.125**：1D 距离比 d 维小 √d 倍，σ_1d = σ_d/√d = 0.5/√16 = 0.125
+3. **bin_centers 每维 L2 归一化**：从 (M,d) 整体归一化改为 (d,M) 每维独立归一化
+
+### 结果
+
+| 数据集 | 指标 | V6.1 | V7 修复版 | vs SOTA |
+|---|---|---|---|---|
+| Cora | ACC | 0.7151 | **0.7333** | 领先 +0.0293 |
+| Cora | NMI | 0.5395 | **0.5529** | 领先 +0.0161 |
+| Cora | ARI | 0.4932 | **0.5140** | 领先 +0.0180 |
+| CiteSeer | ACC | 0.5222 | 0.5289 | 崩溃 -0.1797 |
+| PubMed | ARI | 0.2883 | 0.2890 | 接近 -0.0251 |
+
+### 改动文件
+
+- [wj/model.py](file:///e:/Code/python%20code/WJ/wj/model.py)：method2_lnw 逐维计算 + /d 归一化；bin_centers (d,M) 每维 L2 归一化
+- [wj/training.py](file:///e:/Code/python%20code/WJ/wj/training.py)：TrainConfig.sigma 默认值 0.5 → 0.125
+- [README.md](file:///e:/Code/python%20code/WJ/README.md)：1.2 节更新为逐维 method2 说明
+- [deploy.py](file:///e:/Code/python%20code/WJ/deploy.py)：新增 Git 同步方式（setup 命令改为 git push + 服务器 git pull）
+
+### Git 工作流
+
+- 本地仓库初始化 + push 到 GitHub (https://github.com/rememberde/rememberde)
+- 服务器 SSH key 配置 + clone 仓库
+- deploy.py setup 改为 Git 方式同步代码
+
+---
+
 ## 2026-07-09 — 代码审查修复（Q 一致性 bug + 7 项改进）
 
 ### 背景

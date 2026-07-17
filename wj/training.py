@@ -52,6 +52,10 @@ class TrainConfig:
                                    # 因维度灾难导致 KNN 不可靠，建议降到 ~200
     cl_feat_weight: float = 0.5    # combined CL 中特征 CL 权重 w ∈ [0,1]
                                    # 仅 contrast_mode="combined" 时生效
+    dual_encoder: bool = True      # 双路编码器（图路径GCN + 特征路径MLP）
+                                   # 仅在有外部特征时生效（SBM 自动关闭）
+                                   # 动机：CiteSeer 弱社区图，图结构社区≠标签社区，
+                                   # 特征路径弥补 GCN 过度依赖弱社区结构的缺陷
     eval_every: int = 10           # run KMeans metrics every N epochs (speed)
     seed: int = 42
 
@@ -109,7 +113,8 @@ def train_one(A_np: np.ndarray, labels: np.ndarray, cfg: TrainConfig,
             X_for_cl = U @ torch.diag(S_pca)  # (N, pca_dim) 降维后特征
     model = EntropyGNN(n, cfg.hidden_dim, cfg.emb_dim, cfg.n_communities,
                        n_bins=cfg.n_bins, node_feature_dim=node_feat_dim,
-                       feat_recon=cfg.lambda_feat_recon > 0.0).to(DEVICE)
+                       feat_recon=cfg.lambda_feat_recon > 0.0,
+                       dual_encoder=cfg.dual_encoder).to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
 
     # Build the anti-collapse hinge from cfg; reuse the same instance every
